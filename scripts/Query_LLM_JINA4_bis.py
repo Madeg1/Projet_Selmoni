@@ -416,7 +416,10 @@ def generate_response(brand,query,history=None, max_context_tokens=8000):
         "Utilise UNIQUEMENT le contexte ci-dessous ET l'historique pour répondre.\n"
         "ATTENTION : Le contexte contient des tableaux au format Markdown. Lis attentivement les en-têtes de colonnes.\n"
         "RÈGLE ABSOLUE 1 : Si la réponse n'est pas EXPLICITEMENT dans le contexte, réponds STRICTEMENT ET UNIQUEMENT \"Information introuvable.\". N'ajoute aucune explication.\n"
-        "RÈGLE ABSOLUE 2 : Si tu trouves la réponse, donne UNIQUEMENT la réponse finale sous forme d'une phrase complète, riche et naturelle. Tu dois IMPÉRATIVEMENT réutiliser les mots de la question (variateur, type de montage, etc.) pour formuler cette phrase.\n"
+        "RÈGLE ABSOLUE 2 : Si tu trouves la réponse, formule-la en UNE phrase complète qui reprend les termes clés de la question et de la réponse. "
+        "La phrase doit être suffisamment explicite pour être comprise sans la question. "
+        "Exemple : 'Le self réseau à utiliser avec un variateur MCC91A série 5.3 de puissance 0025 est le ND0070-503.' "
+        "INTERDIT : répondre avec une référence seule comme 'ND0070-503' ou 'BW100-001'.\n"
         "RÈGLE ABSOLUE 3 : NE DÉTAILLE JAMAIS les étapes de ta recherche, tes calculs ou ton raisonnement.\n"
         "<|im_end|>\n"
     )
