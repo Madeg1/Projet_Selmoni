@@ -22,13 +22,13 @@ EMBEDDING_MODEL_NAME = "/app/models/jina-embeddings-v4"
 MAX_TOKENS     = 512
 CHUNK_OVERLAP  = 100
 EMBEDDING_DIM  = 2048
-BATCH_SIZE     = 64
+BATCH_SIZE     = 32
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 # ======================
-# STATE (idempotence)
+# STATE 
 # ======================
 
 def load_state() -> dict:
@@ -88,7 +88,7 @@ def collect_json_files() -> dict[str, list[Path]]:
 
 
 # ======================
-# CHUNKING & TABLEAUX (100% GÉNÉRIQUE)
+# CHUNKING & TABLEAUX 
 # ======================
 
 def split_into_markdown(text: str, tokenizer, max_tokens: int, overlap: int = 100) -> list[str]:
@@ -159,52 +159,40 @@ def process_single_table(table_lines: list[str], context_lines: list[str], rows_
     return results
 
 
-def extract_tables_from_page(page_text: str) -> tuple[list[tuple[str, str]], str]:
-    """
-    Parcourt le texte de la page JSON, isole les tableaux et leur contexte.
-
-    Retourne :
-        table_chunks : liste de (embedding_text, full_table_markdown)
-        text_only    : le texte original dont tous les blocs tableau ont ete supprimes,
-                       pret a etre passe a split_into_markdown sans duplication.
-    """
+def extract_tables_from_page(page_text: str) -> list[tuple[str, str]]:
+    """Parcourt le texte de la page JSON, isole les tableaux et leur contexte."""
     lines = [l.strip() for l in page_text.split("\n")]
-
-    current_table   = []
-    context_lines   = []
-    in_table        = False
-    table_chunks    = []
-    text_only_lines = []   # lignes hors-tableau uniquement
-
+    
+    current_table = []
+    context_lines = []
+    in_table = False
+    results = []
+    
     for l in lines:
         is_table_line = l.startswith("|") and l.endswith("|")
-
+        
         if is_table_line:
             in_table = True
             current_table.append(l)
-            # Ne PAS ajouter a text_only_lines -> c'est le fix du double-chunking
         else:
             if in_table:
-                # Fin du bloc tableau -> traitement Parent-Child
-                table_chunks.extend(process_single_table(current_table, context_lines))
+                # Le tableau est terminé, on le traite
+                results.extend(process_single_table(current_table, context_lines))
                 current_table = []
                 in_table = False
-
-            # Ligne de texte normal -> conservee dans le texte epure
-            text_only_lines.append(l)
-
+            
             clean_line = l.replace("#", "").replace("*", "").strip()
             if clean_line:
                 context_lines.append(clean_line)
+                # On ne garde en mémoire que les 3 dernières phrases avant le tableau
                 if len(context_lines) > 3:
                     context_lines.pop(0)
-
-    # Securite : page qui se termine directement sur un tableau
+                    
+    # Sécurité si la page se termine directement sur un tableau
     if in_table and current_table:
-        table_chunks.extend(process_single_table(current_table, context_lines))
-
-    text_only = "\n".join(text_only_lines)
-    return table_chunks, text_only
+        results.extend(process_single_table(current_table, context_lines))
+        
+    return results
 
 
 def chunks_from_json(json_path: Path, tokenizer) -> list[dict]:
@@ -224,31 +212,28 @@ def chunks_from_json(json_path: Path, tokenizer) -> list[dict]:
             continue
 
         content = ftfy.fix_text(raw_content)
-
-        # 1. Extraction des tableaux (Parent-Child) + recuperation du texte purgé
-        #    extract_tables_from_page retourne desormais un tuple (chunks, text_sans_tableaux)
-        table_data, text_only = extract_tables_from_page(content)
-
+        
+        # 1. Extraction des tableaux via la méthode générique Markdown (Architecture Parent-Child)
+        table_data = extract_tables_from_page(content)
         for embedding_text, full_table in table_data:
             all_chunks.append({
-                "text":        embedding_text,  # Mini-tableau + contexte (Lu par Jina)
+                "text":        embedding_text,  # Mini-tableau brut (Lu par Jina)
                 "llm_context": full_table,      # Tableau complet (Lu par Qwen)
                 "source":      source,
                 "page":        page.get("page"),
                 "is_table":    True,
-                "synthetic":   False,
+                "synthetic":   False,          
             })
 
-        # 2. Découpage classique sur le texte SANS les tableaux (fix du double-chunking)
-        #    On passe text_only et non plus content pour eviter toute duplication
-        chunks = split_into_markdown(text_only, tokenizer, MAX_TOKENS, overlap=CHUNK_OVERLAP)
+        # 2. Découpage classique pour le reste du texte
+        chunks = split_into_markdown(content, tokenizer, MAX_TOKENS, overlap=CHUNK_OVERLAP)
         for chunk in chunks:
             all_chunks.append({
-                "text":        chunk,
-                "llm_context": chunk,
+                "text":        chunk,         
+                "llm_context": chunk,         
                 "source":      source,
                 "page":        page.get("page"),
-                "is_table":    False,   # text_only ne contient plus de lignes | ... |
+                "is_table":    bool(re.search(r"\|[\s\-]+\|", chunk)),
             })
 
     return all_chunks
@@ -453,3 +438,4 @@ if __name__ == "__main__":
     print("\n" + "=" * 60)
     print("  Embedding terminé.")
     print("=" * 60)
+
