@@ -13,6 +13,7 @@ from llama_cpp import Llama
 import gradio as gr
 from gradio_pdf import PDF
 import fitz
+from rank_bm25 import BM25Okapi
 
 import urllib.parse
 
@@ -68,7 +69,8 @@ def extract_pages_with_context(pdf_path, target_page_num, output_path, context=1
 #           CONFIGURATION
 #-------------------------------------
 
-SIMILARITY_THRESHOLD = 0.55
+SIMILARITY_THRESHOLD = 0.55   
+RRF_THRESHOLD        = 0.004  
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
@@ -83,6 +85,152 @@ LOADED_RESOURCES = {}
 PATH_LOGO = '/app/models/selmoni.png'
 logo_base64 = encode_image(PATH_LOGO)
 img_src = f"data:image/png;base64,{logo_base64}" if logo_base64 else "https://via.placeholder.com/60"
+
+#-------------------------------------
+#          CLASSE HYBRID RETRIEVER
+#-------------------------------------
+
+class HybridRetriever:
+    def __init__(self, chunks, embedding_model, faiss_index):
+        self.chunks = chunks
+        self.embedding_model = embedding_model
+        self.faiss_index = faiss_index
+        
+        # Tokenisation pour BM25
+        tokenized = [self._tokenize(c['text']) for c in chunks]
+        self.bm25 = BM25Okapi(tokenized)
+    
+    def _tokenize(self, text):
+        """
+        Tokenisation technique : préserver les entités critiques.
+        Ex: "MCC91A-0025" ne doit pas être splitté en ["MCC91A", "0025"]
+        """
+        import re
+        # Garder les tokens alphanumériques ET les références avec tirets
+        tokens = re.findall(r'[A-Z0-9]+-[A-Z0-9-]+|[\w]+', text.lower())
+        return tokens
+    
+    def retrieve(self, query, top_k=40, alpha=0.5):
+        """
+        alpha=0.5 : équilibre dense/sparse
+        alpha=0.7 : favorise le dense (questions conceptuelles)
+        alpha=0.3 : favorise BM25 (lookup de références)
+        """
+        # Score dense
+        query_emb = self.embedding_model.encode([query])
+        dense_scores, dense_ids = self.faiss_index.search(query_emb, top_k)
+        dense_scores = dense_scores[0]
+        dense_ids = dense_ids[0]
+        
+        # Score BM25
+        tokenized_query = self._tokenize(query)
+        bm25_scores = self.bm25.get_scores(tokenized_query)
+        
+        # Normalisation min-max pour rendre les scores comparables
+        def normalize(scores):
+            mn, mx = scores.min(), scores.max()
+            if mx == mn:
+                return np.zeros_like(scores)
+            return (scores - mn) / (mx - mn)
+        
+        # Fusion RRF (plus robuste que score linéaire)
+        final_scores = self._rrf_fusion(dense_ids, dense_scores, bm25_scores, top_k)
+        return final_scores
+    
+    def _rrf_fusion(self, dense_ids, dense_scores, bm25_scores, top_k, k=60):
+        rrf_scores = {}
+    
+        # Rangs dense
+        for rank, idx in enumerate(dense_ids):
+            if idx == -1:  # ← AJOUT : FAISS retourne -1 si pas assez de résultats
+                continue
+            rrf_scores[idx] = rrf_scores.get(idx, 0) + 1 / (k + rank + 1)
+    
+        # Rangs BM25 — seulement si des scores non-nuls existent
+        if bm25_scores.max() > 0:   # ← AJOUT : garde contre BM25 vide
+            bm25_ranked = np.argsort(bm25_scores)[::-1][:top_k]
+            for rank, idx in enumerate(bm25_ranked):
+                rrf_scores[idx] = rrf_scores.get(idx, 0) + 1 / (k + rank + 1)
+    
+        sorted_ids = sorted(rrf_scores, key=rrf_scores.get, reverse=True)
+        return [(idx, rrf_scores[idx]) for idx in sorted_ids[:top_k]]
+    
+        
+#--------------------------------------
+#       CLASSE QUERY ANALYZER
+#--------------------------------------
+       
+class QueryAnalyzer:
+    """
+    Analyse la query sans LLM pour préserver les entités critiques.
+    Détecte l'intent pour ajuster l'alpha BM25/Dense.
+    """
+    
+    PATTERNS = {
+        'product_ref': r'\b[A-Z]{2,}[0-9A-Z]*-[0-9A-Z-]+\b',
+        'value_ohm':   r'\b\d+[.,]?\d*\s*Ω\b',
+        'value_watt':  r'\b\d+[.,]?\d*\s*(?:kW|W|mW)\b',
+        'value_volt':  r'\b(?:DC\s*)?\d+[.,]?\d*\s*V\b',
+        'value_amp':   r'\b\d+[.,]?\d*\s*(?:mA|A)\b',
+    }
+    
+    LOOKUP_KEYWORDS       = ['référence','quel','quelle','associer','utiliser avec',
+                             'numéro','code','self','résistance de freinage',
+                             'accessoire','compatible']
+    COMPATIBILITY_KEYWORDS = ['peut-on','compatible','possible','fonctionner avec',
+                              'utiliser une']
+    VALUE_KEYWORDS        = ['puissance','courant','tension','température',
+                             'consommation','absorbée','caractéristiques']
+    
+    def analyze(self, query):
+        entities = {}
+        for entity_type, pattern in self.PATTERNS.items():
+            found = re.findall(pattern, query, re.IGNORECASE)
+            if found:
+                entities[entity_type] = found
+        
+        intent = self._detect_intent(query)
+        alpha  = self._get_alpha(intent)
+        
+        return {
+            'original_query':  query,
+            'entities':        entities,
+            'intent':          intent,
+            'alpha':           alpha,
+            'augmented_query': self._augment(query, entities)
+        }
+    
+    def _detect_intent(self, query):
+        q = query.lower()
+        if any(k in q for k in self.COMPATIBILITY_KEYWORDS):
+            return 'compatibility'
+        if any(k in q for k in self.LOOKUP_KEYWORDS):
+            return 'lookup'
+        if any(k in q for k in self.VALUE_KEYWORDS):
+            return 'value_extraction'
+        return 'factual'
+    
+    def _get_alpha(self, intent):
+        return {
+            'lookup':           0.25,  # Favorise BM25
+            'compatibility':    0.40,
+            'value_extraction': 0.55,  # Favorise dense
+            'factual':          0.50,
+        }.get(intent, 0.50)
+    
+    def _augment(self, query, entities):
+        """
+        Ajoute les entités en fin de query pour renforcer BM25.
+        Ne modifie JAMAIS les valeurs originales.
+        """
+        extras = []
+        for values in entities.values():
+            extras.extend(values)
+        if extras:
+            return query + " " + " ".join(set(extras))
+        return query
+
+query_analyzer = QueryAnalyzer()
 
 #-------------------------------------
 #    CLASSE WRAPPER JINA 
@@ -125,30 +273,35 @@ class JinaEmbedder:#utilisation d'une classe pour le modèle Jina
 model = JinaEmbedder(EMBEDDING_MODEL_NAME, DEVICE)
 
 def get_brand_resources(brand_name):
-    """
-    Charge l'index FAISS et les chunks pour une marque spécifique si ce n'est pas déjà fait.
-    Retourne (index, text_chunks) ou lève une exception.
-    """
     if brand_name in LOADED_RESOURCES:
-        return LOADED_RESOURCES[brand_name]['index'], LOADED_RESOURCES[brand_name]['chunks']
+        return (
+            LOADED_RESOURCES[brand_name]['index'],
+            LOADED_RESOURCES[brand_name]['chunks'],
+            LOADED_RESOURCES[brand_name]['retriever']
+        )
     
-    print(f" Chargement des ressources pour : {brand_name}...")
+    print(f"Chargement des ressources pour : {brand_name}...")
     
     brand_path = os.path.join(BASE_EMBEDDINGS_PATH, brand_name)
     faiss_path = os.path.join(brand_path, f"{brand_name}.faiss")
-    pkl_path = os.path.join(brand_path, f"{brand_name}.pkl")     
+    pkl_path   = os.path.join(brand_path, f"{brand_name}.pkl")
 
     try:
-        index = faiss.read_index(faiss_path)
+        index  = faiss.read_index(faiss_path)
         with open(pkl_path, 'rb') as f:
             chunks = pickle.load(f)
+
+        retriever = HybridRetriever(chunks, model, index)
         
-        # Sauvegarde en cache mémoire
-        LOADED_RESOURCES[brand_name] = {'index': index, 'chunks': chunks}
-        print(f" Ressources {brand_name} chargées.")
-        return index, chunks
+        LOADED_RESOURCES[brand_name] = {
+            'index':     index,
+            'chunks':    chunks,
+            'retriever': retriever   
+        }
+        print(f"Ressources {brand_name} chargées.")
+        return index, chunks, retriever
     except Exception as e:
-        print(f" Erreur chargement {brand_name}: {e}")
+        print(f"Erreur chargement {brand_name}: {e}")
         raise e
 
 print("Ressources prêtes.")
@@ -257,7 +410,7 @@ def needs_nomenclature_hint(brand: str, query: str) -> bool:
     
     
     
-def generate_response(brand,query,history=None, max_context_tokens=8000):
+def generate_response(brand, query, history=None, max_context_tokens=8000):
     if history is None:
         history = []
     
@@ -265,32 +418,50 @@ def generate_response(brand,query,history=None, max_context_tokens=8000):
         return "Veuillez sélectionner une marque.", ""    
     
     print(f"Début génération | Marque: {brand} | Query: '{query}'")
+
+    # Analyse de la query
+    analysis      = query_analyzer.analyze(query)
+    search_query  = analysis['augmented_query']
+    alpha         = analysis['alpha']
+    intent        = analysis['intent']
     
-    # ==========Contextualisation de la recherche FAISS===============
-    search_query = query
+    print(f"Intent détecté : {intent} | Alpha BM25/Dense : {alpha}")
+    print(f"Entités extraites : {analysis['entities']}")
+    print(f"Query augmentée : '{search_query}'")
+    
+    # Contexte historique
     if history:
-        # On récupère la toute dernière question posée par l'utilisateur
         last_user_query = history[-1][0]
-        # On combine l'ancienne et la nouvelle question pour aider FAISS
-        # Ex: "Quelles sont les causes du défaut 11.9 ? Comment le corriger ?"
-        search_query = f"{last_user_query} {query}"
-        print(f"Recherche FAISS reformulée : '{search_query}'")
-    # =========================================================
-    
-    
-    # Chargement dynamique des ressources de la marque
+        search_query = f"{last_user_query} {search_query}"
+        print(f"Query enrichie avec historique : '{search_query}'")
+
+    # Chargement ressources
     try:
-        current_index, current_chunks = get_brand_resources(brand)
+        current_index, current_chunks, retriever = get_brand_resources(brand)
     except Exception as e:
         return f"Erreur critique lors du chargement de la marque {brand} : {str(e)}", ""
+
+    # Retrieval Hybride
+    start_search = time.perf_counter()
     
-    # Recherche large (FAISS)
-    relevant_chunks, similarities, search_time = search(search_query, current_index, current_chunks, k=15)
+    hybrid_results = retriever.retrieve(search_query, top_k=30, alpha=alpha)
+    using_hybrid = True
+    
+    # Reconstruction au format attendu par le reste du code
+    relevant_chunks = []
+    similarities    = []
+    for chunk_idx, score in hybrid_results:
+        if chunk_idx < len(current_chunks):
+            relevant_chunks.append(current_chunks[chunk_idx])
+            similarities.append(float(score))
+    
+    search_time = time.perf_counter() - start_search
+    similarities = np.array(similarities)
     
     pdf_html_output = '<div style="text-align:center; color:#94a3b8;">Aucun document à afficher.</div>'
     
     if not relevant_chunks:
-        return "Aucune information trouvée.",""
+        return "Aucune information trouvée.", ""
     
     #--- GESTION DU PDF ---
     best_chunk = relevant_chunks[0]
@@ -363,7 +534,8 @@ def generate_response(brand,query,history=None, max_context_tokens=8000):
             continue
 
         # Filtre Pertinence
-        if sim < SIMILARITY_THRESHOLD: 
+        effective_threshold = RRF_THRESHOLD if using_hybrid else SIMILARITY_THRESHOLD
+        if sim < effective_threshold:
             print(f" [Rejeté - Score faible] {source_identifier} (Sim: {sim:.4f})")
             continue
         
