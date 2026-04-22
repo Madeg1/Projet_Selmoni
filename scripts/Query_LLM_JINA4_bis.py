@@ -13,7 +13,7 @@ from llama_cpp import Llama
 import gradio as gr
 from gradio_pdf import PDF
 import fitz
-
+from transformers import AutoModelForSequenceClassification
 import urllib.parse
 
 #---Fonction pour encoder l'image---
@@ -73,6 +73,7 @@ DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
 EMBEDDING_MODEL_NAME = '/app/models/jina-embeddings-v4'
+RERANKER_MODEL_NAME = '/app/models/jina-reranker-v2-base-multilingual'
 LLM_MODEL_PATH = '/app/models/qwen2.5-7b-instruct-q6_k-00001-of-00002.gguf'
 
 BASE_EMBEDDINGS_PATH = '/app/embeddings'
@@ -83,6 +84,42 @@ LOADED_RESOURCES = {}
 PATH_LOGO = '/app/models/selmoni.png'
 logo_base64 = encode_image(PATH_LOGO)
 img_src = f"data:image/png;base64,{logo_base64}" if logo_base64 else "https://via.placeholder.com/60"
+
+#-------------------------------------
+#    CLASSE WRAPPER RERANKER
+#-------------------------------------
+class JinaReranker:
+    def __init__(self, model_path, device):
+        print(f" Chargement du Reranker Jina sur : {device.upper()}")
+        try:
+            # On charge le modèle en fp16 pour économiser la VRAM
+            self.model = AutoModelForSequenceClassification.from_pretrained(
+                model_path,
+                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                trust_remote_code=True
+            ).to(device)
+            self.model.eval()
+        except Exception as e:
+            print(f" Erreur chargement Reranker: {e}")
+            sys.exit(1)
+
+    def compute_scores(self, query, texts):
+        """Calcule le score de pertinence entre la question et chaque chunk"""
+        with torch.no_grad():
+            # Le modèle attend une liste de paires [question, document]
+            pairs = [[query, text] for text in texts]
+            # La méthode compute_score est intégrée dans le code distant de Jina
+            scores = self.model.compute_score(pairs)
+            
+            # Conversion propre en liste de floats
+            if isinstance(scores, torch.Tensor):
+                scores = scores.cpu().numpy().tolist()
+            elif isinstance(scores, np.ndarray):
+                scores = scores.tolist()
+            elif isinstance(scores, float):
+                scores = [scores]
+                
+            return scores
 
 #-------------------------------------
 #    CLASSE WRAPPER JINA 
@@ -123,6 +160,7 @@ class JinaEmbedder:#utilisation d'une classe pour le modèle Jina
 
 
 model = JinaEmbedder(EMBEDDING_MODEL_NAME, DEVICE)
+reranker = JinaReranker(RERANKER_MODEL_NAME, DEVICE)
 
 def get_brand_resources(brand_name):
     """
@@ -240,12 +278,10 @@ def find_best_matching_chunk(llm_answer, chunks):
     
 
 SEW_NOMENCLATURE_HINT = """
-RÈGLES DE DÉCODAGE DES RÉFÉRENCES SEW (À APPLIQUER SILENCIEUSEMENT) :
-- "5E3" = ligne "5.3.." dans les tableaux.
-- "2E1" = ligne "2.1.." dans les tableaux.
-- Le suffixe "/M" = "montage en semelle" ou "montage empilé".
-- Pour trouver un accessoire, extrais d'abord la puissance de la référence (ex: "0025" -> 25). 
-- Identifie la bonne ligne (ex: 5.3..) puis trouve la colonne où cette puissance (25) est strictement comprise dans la plage indiquée (ex: 0010 - 0055). La réponse est le nom de cette colonne.
+RÈGLES DE DÉCODAGE SEW (APPLICATION OBLIGATOIRE) :
+1. Pour trouver un accessoire, convertis la référence en entier pur (ex: MCC91A-0025 -> La puissance cible est 25).
+2. Convertis les plages des tableaux en entiers purs (ex: "0010 - 0070" devient "de 10 à 70").
+3. Compare la puissance cible à chaque plage.
 """
 def needs_nomenclature_hint(brand: str, query: str) -> bool:
     """Détecte si la query implique un décodage de référence SEW."""
@@ -254,7 +290,23 @@ def needs_nomenclature_hint(brand: str, query: str) -> bool:
     # Détecte un pattern de référence type MCC91A-XXXX-XEX
     return bool(re.search(r"MCC\w+[-–]\d{4}[-–]\d+E\d+", query, re.IGNORECASE))
     
+def rewrite_query(history, current_query, llm):
+    # On inclut l'historique dans le prompt uniquement s'il existe
+    hist_text = f"Historique: {history[-1]}\n" if history else ""
     
+    prompt = (
+        "<|im_start|>system\nTu es un reformulateur de requête pour un moteur de recherche technique. "
+        "Ta tâche est de nettoyer le dernier message de l'utilisateur pour optimiser la recherche.\n"
+        "1. Si tu vois une référence produit très longue (ex: MCC91A-0025-5E3-4-000/CSO/CFX11A-N), supprime les suffixes inutiles de communication (/CSO, /CFX...) et ne garde que la famille et la puissance.\n"
+        "2. Si l'utilisateur dit juste 'oui' ou un mot court, utilise l'historique pour formuler une question complète.\n"
+        "3. Ne réponds SURTOUT PAS à la question technique. Renvoie UNIQUEMENT la phrase de recherche nettoyée.<|im_end|>\n"
+        f"{hist_text}"
+        f"Dernier message: {current_query}\n"
+        "<|im_start|>assistant\nRequête optimisée :"
+    )
+    
+    response = llm(prompt, max_tokens=50, temperature=0.1, stop=["\n", "<|im_end|>"])
+    return response['choices'][0]['text'].strip()    
     
     
 def generate_response(brand,query,history=None, max_context_tokens=8000):
@@ -267,14 +319,10 @@ def generate_response(brand,query,history=None, max_context_tokens=8000):
     print(f"Début génération | Marque: {brand} | Query: '{query}'")
     
     # ==========Contextualisation de la recherche FAISS===============
-    search_query = query
-    if history:
-        # On récupère la toute dernière question posée par l'utilisateur
-        last_user_query = history[-1][0]
-        # On combine l'ancienne et la nouvelle question pour aider FAISS
-        # Ex: "Quelles sont les causes du défaut 11.9 ? Comment le corriger ?"
-        search_query = f"{last_user_query} {query}"
-        print(f"Recherche FAISS reformulée : '{search_query}'")
+    # On reformule TOUJOURS la question, qu'il y ait un historique ou non
+    print(" Nettoyage de la requête par le LLM...")
+    search_query = rewrite_query(history, query, llm)
+    print(f"Question reformulée pour FAISS : '{search_query}'")
     # =========================================================
     
     
@@ -285,15 +333,35 @@ def generate_response(brand,query,history=None, max_context_tokens=8000):
         return f"Erreur critique lors du chargement de la marque {brand} : {str(e)}", ""
     
     # Recherche large (FAISS)
-    relevant_chunks, similarities, search_time = search(search_query, current_index, current_chunks, k=15)
+    faiss_chunks, similarities, search_time = search(search_query, current_index, current_chunks, k=30)
+    if not faiss_chunks:
+        return "Aucune information trouvée dans la base.", ""
     
-    pdf_html_output = '<div style="text-align:center; color:#94a3b8;">Aucun document à afficher.</div>'
+    #RERANKING
+    print(f"\n Reranking de {len(faiss_chunks)} chunks...")
+    start_rerank = time.perf_counter()
     
-    if not relevant_chunks:
-        return "Aucune information trouvée.",""
+    texts_to_rerank = [c.get('llm_context', c['text']) for c in faiss_chunks]
+    
+    try:
+        rerank_scores = reranker.compute_scores(search_query, texts_to_rerank)
+    except Exception as e:
+        print(f"Erreur Reranker ({e}). Fallback sur FAISS.")
+        rerank_scores = similarities
+        
+    rerank_time = time.perf_counter() - start_rerank
+    print(f" Reranking terminé en {rerank_time:.2f}s")
+
+    # On associe chaque chunk à son score de reranking et on trie du meilleur au pire
+    scored_chunks = list(zip(faiss_chunks, rerank_scores))
+    scored_chunks.sort(key=lambda x: x[1], reverse=True)
+    
+    # On isole les chunks triés pour la suite du pipeline
+    relevant_chunks = [chunk for chunk, score in scored_chunks]
     
     #--- GESTION DU PDF ---
-    best_chunk = relevant_chunks[0]
+    best_chunk = scored_chunks[0][0]
+    best_score = scored_chunks[0][1]
     filename = best_chunk.get('source', '')
     page_num = best_chunk.get('page', 1)
     
@@ -302,11 +370,9 @@ def generate_response(brand,query,history=None, max_context_tokens=8000):
     
     # Fichier temporaire
     temp_pdf_path = f"/tmp/context_{page_num}_{int(time.time())}.pdf"
+    pdf_html_output = '<div style="text-align:center; color:#94a3b8;">Aucun document à afficher.</div>'
     
-    
-    if os.path.exists(full_path) and similarities[0] >= SIMILARITY_THRESHOLD:
-        print(f"Extraction avec contexte (3 pages)...")
-        
+    if os.path.exists(full_path) and best_score>0:
         # On extrait 3 pages : [Page Avant] - [Page Cible] - [Page Après]
         extracted_path = extract_pages_with_context(full_path, page_num, temp_pdf_path, context=1)
         
@@ -329,6 +395,7 @@ def generate_response(brand,query,history=None, max_context_tokens=8000):
     
     context_texts = []
     sources_formatted = [] 
+    injected_chunks_list = []
     current_token_count = 0
     seen_hashes = set()
     
@@ -343,7 +410,7 @@ def generate_response(brand,query,history=None, max_context_tokens=8000):
     print(f"ANALYSE DES CHUNKS POUR : {query}")
     print(f"{'='*60}")
 
-    for i, (chunk_data, sim) in enumerate(zip(relevant_chunks, similarities)):
+    for i, (chunk_data, sim) in enumerate(scored_chunks):
         
         # --- NOUVEAU : On s'arrête si on a nos 5 bons chunks ---
         if chunks_injected >= MAX_CHUNKS_TO_INJECT:
@@ -363,8 +430,8 @@ def generate_response(brand,query,history=None, max_context_tokens=8000):
             continue
 
         # Filtre Pertinence
-        if sim < SIMILARITY_THRESHOLD: 
-            print(f" [Rejeté - Score faible] {source_identifier} (Sim: {sim:.4f})")
+        if sim < 0: 
+            print(f" [Rejeté - Score négatif] {source_identifier} (Score: {sim:.4f})")
             continue
         
         chunk_tokens = llm.tokenize(text_content.encode("utf-8"))
@@ -380,7 +447,8 @@ def generate_response(brand,query,history=None, max_context_tokens=8000):
         # ========================================================
         seen_hashes.add(content_hash)
         context_texts.append(text_content)
-        chunks_injected += 1 # On incrémente notre compteur !
+        injected_chunks_list.append(chunk_data) #on garde le chunk entier
+        chunks_injected += 1 # On incrémente notre compteur
         
         # Formatage 
         source_line = f"{filename} — Page {page_num} (Score: {sim:.4f})"
@@ -411,16 +479,15 @@ def generate_response(brand,query,history=None, max_context_tokens=8000):
     
     prompt_template = (
         "<|im_start|>system\n"
-        "Tu es un assistant expert technique chez Selmoni.\n"
+        "Tu es un assistant expert technique chez Selmoni. Tu es strictement factuel.\n"
         + hint +
         "Utilise UNIQUEMENT le contexte ci-dessous ET l'historique pour répondre.\n"
-        "ATTENTION : Le contexte contient des tableaux au format Markdown. Lis attentivement les en-têtes de colonnes.\n"
-        "RÈGLE ABSOLUE 1 : Si la réponse n'est pas EXPLICITEMENT dans le contexte, réponds STRICTEMENT ET UNIQUEMENT \"Information introuvable.\". N'ajoute aucune explication.\n"
-        "RÈGLE ABSOLUE 2 : Si tu trouves la réponse, formule-la en UNE phrase complète qui reprend les termes clés de la question et de la réponse. "
-        "La phrase doit être suffisamment explicite pour être comprise sans la question. "
-        "Exemple : 'Le self réseau à utiliser avec un variateur MCC91A série 5.3 de puissance 0025 est le ND0070-503.' "
-        "INTERDIT : répondre avec une référence seule comme 'ND0070-503' ou 'BW100-001'.\n"
-        "RÈGLE ABSOLUE 3 : NE DÉTAILLE JAMAIS les étapes de ta recherche, tes calculs ou ton raisonnement.\n"
+        "ATTENTION : Le contexte contient des tableaux. Lis attentivement les en-têtes.\n"
+        "RÈGLE 1 : Tu DOIS TOUJOURS réfléchir étape par étape. Écris TOUTE ton analyse du texte et tes calculs entre des balises <reflexion> et </reflexion> au tout début de ta réponse.\n"
+        "RÈGLE 2 : Dans ta <reflexion>, si tu dois choisir une valeur dans une plage de type SEW (ex: 0010 - 0070), retire les zéros initiaux et écris explicitement l'inégalité mathématique (ex: 10 <= 25 <= 70) pour prouver ton choix.\n"
+        "RÈGLE 3 : N'invente JAMAIS d'informations. Si une donnée est absente du contexte, déclare explicitement qu'elle est introuvable.\n"
+        "RÈGLE 4 : En dehors des balises de réflexion, formule ta réponse finale. Cette réponse DOIT être une phrase complète, détaillée, reprenant les mots-clés exacts (ex: 'La puissance absorbée de la borne STO est de 150 mW.').\n"
+        "RÈGLE 5 (INTERACTION) : Si l'information est vraiment introuvable, demande-toi si l'utilisateur n'a pas utilisé un synonyme (ex: 'consommation' au lieu de 'puissance'). Si c'est le cas, pose-lui une question courte et polie pour clarifier (Ex: 'Information introuvable. Cherchiez-vous la puissance absorbée ?').\n"
         "<|im_end|>\n"
     )
     
@@ -448,19 +515,19 @@ def generate_response(brand,query,history=None, max_context_tokens=8000):
     )
     
     duration = time.perf_counter() - start_llm
-    answer = response['choices'][0]['text'].strip() 
+    raw_answer = response['choices'][0]['text'].strip() 
     
-    # On garde le print pour le debug au cas où !
-    print(f"\n--- RÉPONSE BRUTE DU LLM ---\n{answer}\n----------------------------\n")
+    print(f"\n--- RÉPONSE BRUTE DU LLM ---\n{raw_answer}\n----------------------------\n")
     print(f" Réponse générée en {duration:.2f}s")
     
-    # ====================================================================
-    # On trouve la page après la réponse du LLM
-    # ====================================================================
-    pdf_html_output = '<div style="text-align:center; color:#94a3b8;">Aucun document à afficher.</div>'
+    # 1. On cherche la page PDF en utilisant TOUTE la réponse brute (réflexion incluse) pour maximiser le "match" sémantique
+    target_chunk = find_best_matching_chunk(raw_answer, injected_chunks_list)
     
-    # On compare les mots de la réponse avec les mots des chunks pour trouver le vrai
-    target_chunk = find_best_matching_chunk(answer, relevant_chunks)
+    # 2. On nettoie la réponse pour l'utilisateur (on supprime ce qui est entre <reflexion> et </reflexion>)
+    clean_answer = re.sub(r'<reflexion>.*?</reflexion>', '', raw_answer, flags=re.DOTALL).strip()
+    
+    # Sécurité : si le modèle n'a pas mis de balises, on affiche tout
+    display_answer = clean_answer if clean_answer else raw_answer
     
     if target_chunk:
         filename = target_chunk.get('source', '')
@@ -493,11 +560,11 @@ def generate_response(brand,query,history=None, max_context_tokens=8000):
              print(f"Fichier source introuvable : {full_path}")
     
     final_output = (
-        f"{answer}\n\n"
+        f"{display_answer}\n\n"
         f"---\n"
         f"**Sources utilisées :**\n"
         f"{source_list_str}\n\n"
-        f"*(Recherche: {search_time:.2f}s | Génération: {duration:.2f}s)*"
+        f"*(Recherche: {search_time:.2f}s | Reranking: {rerank_time:.2f}s | Génération: {duration:.2f}s)*"
     )
     
     return final_output, pdf_html_output

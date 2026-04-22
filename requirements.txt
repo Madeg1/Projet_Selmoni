@@ -26,6 +26,6 @@ gradio-pdf
 fastapi
 uvicorn
 
-
+accelerate
 
 
