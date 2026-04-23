@@ -26,6 +26,8 @@ gradio-pdf
 fastapi
 uvicorn
 
+accelerate
+rank_bm25
 
 
 
