@@ -88,10 +88,11 @@ def collect_json_files() -> dict[str, list[Path]]:
 
 
 # ======================
-# CHUNKING & TABLEAUX 
+# CHUNKING & TABLEAUX (MODE HiRAG)
 # ======================
 
 def split_into_markdown(text: str, tokenizer, max_tokens: int, overlap: int = 100) -> list[str]:
+    """Découpe un bloc de texte s'il dépasse la limite de tokens."""
     lines  = text.split("\n")
     chunks = []
     current_chunk_tokens = []
@@ -122,77 +123,134 @@ def split_into_markdown(text: str, tokenizer, max_tokens: int, overlap: int = 10
     return chunks
 
 
-def process_single_table(table_lines: list[str], context_lines: list[str], rows_per_chunk: int = 5) -> list[tuple[str, str]]:
+def process_page_hirag(content: str, source: str, page_num: int, tokenizer) -> list[dict]:
     """
-    Traitement 100% générique : découpe le tableau en petits blocs Markdown 
-    auto-portants (avec en-tête) pour préserver la sémantique native.
+    Parcourt la page ligne par ligne en mémorisant la hiérarchie des titres (H1, H2, H3...).
+    Sépare proprement les blocs de texte et les tableaux sans doublons.
+    Fusionne le texte introductif avec le tableau qui le suit.
     """
-    if len(table_lines) < 3: 
-        return []
+    lines = content.split('\n')
+    chunks = []
     
-    # On récupère le contexte factuel (ex: les 3 phrases avant le tableau)
-    context_str = " ".join(context_lines[-3:]) if context_lines else ""
-    
-    # Le tableau complet original (pour que Qwen puisse tout lire d'un coup)
-    full_table_markdown = "\n".join(context_lines[-2:] + table_lines)
-    
-    # Extraction de la structure Markdown
-    header_line = table_lines[0]
-    separator_line = table_lines[1]
-    
-    # On isole les données en ignorant les bordures vides
-    data_lines = [l for l in table_lines[2:] if l.strip() and not re.match(r"^\|[\s\-\|]+\|$", l)]
-    
-    results = []
-    
-    # On crée des "mini-tableaux" par lots pour éviter de dépasser la limite de tokens
-    for i in range(0, len(data_lines), rows_per_chunk):
-        batch_lines = data_lines[i : i + rows_per_chunk]
-        mini_table = [header_line, separator_line] + batch_lines
-        mini_table_str = "\n".join(mini_table)
-        
-        # Ce que Jina va embedder : juste le contexte réel suivi du tableau brut.
-        embedding_text = f"{context_str}\n\n{mini_table_str}".strip()
-        
-        results.append((embedding_text, full_table_markdown))
-    
-    return results
-
-
-def extract_tables_from_page(page_text: str) -> list[tuple[str, str]]:
-    """Parcourt le texte de la page JSON, isole les tableaux et leur contexte."""
-    lines = [l.strip() for l in page_text.split("\n")]
-    
+    active_headers = {}  # Stocke le niveau du titre -> Texte du titre (ex: {2: "## 4.23 Accessoires"})
+    current_text_block = []
     current_table = []
-    context_lines = []
     in_table = False
-    results = []
+    table_intro = ""  # <--- NOUVEAU : Mémoire tampon pour l'intro du tableau
     
-    for l in lines:
-        is_table_line = l.startswith("|") and l.endswith("|")
+    def get_hierarchy_context() -> str:
+        """Génère le chemin sémantique parent pour le chunk."""
+        if not active_headers:
+            return ""
+        sorted_levels = sorted(active_headers.keys())
+        hierarchy = " > ".join([active_headers[lvl].replace('#', '').strip() for lvl in sorted_levels])
+        return f"[CONTEXTE : {hierarchy}]\n\n"
+
+    def flush_text():
+        nonlocal current_text_block
+        if not current_text_block:
+            return
         
-        if is_table_line:
-            in_table = True
-            current_table.append(l)
+        raw_text = "\n".join(current_text_block).strip()
+        if raw_text:
+            hierarchy_prefix = get_hierarchy_context()
+            
+            # Si le bloc est trop long, on le sub-chunk (ex: très long paragraphe)
+            sub_chunks = split_into_markdown(raw_text, tokenizer, MAX_TOKENS, CHUNK_OVERLAP)
+            for sc in sub_chunks:
+                final_text = hierarchy_prefix + sc
+                chunks.append({
+                    "text": final_text,         # Jina lit le contexte + le texte
+                    "llm_context": final_text,  # Qwen lit la même chose
+                    "source": source,
+                    "page": page_num,
+                    "is_table": False,
+                    "synthetic": False
+                })
+        current_text_block = []
+
+    def flush_table():
+        nonlocal current_table, table_intro
+        if len(current_table) < 3: # Pas un vrai tableau Markdown
+            if table_intro: # On restaure l'intro si ce n'était pas un vrai tableau
+                current_text_block.insert(0, table_intro)
+                table_intro = ""
+            current_text_block.extend(current_table)
+            current_table = []
+            return
+            
+        hierarchy_prefix = get_hierarchy_context()
+        
+        # --- NOUVEAU : On fusionne l'intro avec le tableau ---
+        intro_str = f"{table_intro}\n\n" if table_intro else ""
+        
+        header = current_table[0]
+        separator = current_table[1]
+        data_rows = current_table[2:]
+        
+        # Contexte complet envoyé au LLM : Hiérarchie + Texte Introductif + Tableau complet
+        full_table_markdown = hierarchy_prefix + intro_str + "\n".join(current_table)
+        
+        # Contexte découpé pour l'Embedding (Précision laser pour Jina)
+        rows_per_batch = 5
+        for i in range(0, len(data_rows), rows_per_batch):
+            batch_rows = data_rows[i : i + rows_per_batch]
+            mini_table = "\n".join([header, separator] + batch_rows)
+            
+            # Jina verra maintenant la phrase "Le tableau suivant montre..." !
+            embedding_text = hierarchy_prefix + intro_str + mini_table
+            
+            chunks.append({
+                "text": embedding_text,      # Mini-tableau avec en-têtes + intro
+                "llm_context": full_table_markdown,  # Tableau COMPLET + intro
+                "source": source,
+                "page": page_num,
+                "is_table": True,
+                "synthetic": False
+            })
+        current_table = []
+        table_intro = "" # On réinitialise pour le prochain tableau
+
+    # --- LECTURE LIGNE PAR LIGNE ---
+    for line in lines:
+        header_match = re.match(r'^(#{1,6})\s+(.*)', line)
+        is_table_line = line.strip().startswith('|') and line.strip().endswith('|')
+        
+        if header_match:
+            flush_text()
+            flush_table()
+            
+            level = len(header_match.group(1))
+            # On efface les sous-titres plus profonds devenus obsolètes
+            keys_to_remove = [k for k in active_headers.keys() if k >= level]
+            for k in keys_to_remove:
+                del active_headers[k]
+                
+            active_headers[level] = line.strip()
+            # On ajoute quand même le titre dans le bloc de texte courant
+            current_text_block.append(line) 
+            
+        elif is_table_line:
+            if not in_table:
+                # --- NOUVEAU : On ne flush plus le texte, on l'absorbe ! ---
+                table_intro = "\n".join(current_text_block).strip()
+                current_text_block = [] # On vide le bloc pour qu'il ne soit pas flushé en texte standard
+                in_table = True
+            current_table.append(line.strip())
+            
         else:
             if in_table:
-                # Le tableau est terminé, on le traite
-                results.extend(process_single_table(current_table, context_lines))
-                current_table = []
+                flush_table() # Fin du tableau
                 in_table = False
             
-            clean_line = l.replace("#", "").replace("*", "").strip()
-            if clean_line:
-                context_lines.append(clean_line)
-                # On ne garde en mémoire que les 3 dernières phrases avant le tableau
-                if len(context_lines) > 3:
-                    context_lines.pop(0)
-                    
-    # Sécurité si la page se termine directement sur un tableau
-    if in_table and current_table:
-        results.extend(process_single_table(current_table, context_lines))
-        
-    return results
+            if line.strip():
+                current_text_block.append(line)
+                
+    # Vider les tampons à la fin de la page
+    flush_text()
+    flush_table()
+    
+    return chunks
 
 
 def chunks_from_json(json_path: Path, tokenizer) -> list[dict]:
@@ -212,29 +270,9 @@ def chunks_from_json(json_path: Path, tokenizer) -> list[dict]:
             continue
 
         content = ftfy.fix_text(raw_content)
-        
-        # 1. Extraction des tableaux via la méthode générique Markdown (Architecture Parent-Child)
-        table_data = extract_tables_from_page(content)
-        for embedding_text, full_table in table_data:
-            all_chunks.append({
-                "text":        embedding_text,  # Mini-tableau brut (Lu par Jina)
-                "llm_context": full_table,      # Tableau complet (Lu par Qwen)
-                "source":      source,
-                "page":        page.get("page"),
-                "is_table":    True,
-                "synthetic":   False,          
-            })
-
-        # 2. Découpage classique pour le reste du texte
-        chunks = split_into_markdown(content, tokenizer, MAX_TOKENS, overlap=CHUNK_OVERLAP)
-        for chunk in chunks:
-            all_chunks.append({
-                "text":        chunk,         
-                "llm_context": chunk,         
-                "source":      source,
-                "page":        page.get("page"),
-                "is_table":    bool(re.search(r"\|[\s\-]+\|", chunk)),
-            })
+        # On passe directement la page à notre processeur HiRAG
+        page_chunks = process_page_hirag(content, source, page.get("page"), tokenizer)
+        all_chunks.extend(page_chunks)
 
     return all_chunks
 
@@ -438,4 +476,5 @@ if __name__ == "__main__":
     print("\n" + "=" * 60)
     print("  Embedding terminé.")
     print("=" * 60)
+
 
