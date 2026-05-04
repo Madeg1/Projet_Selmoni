@@ -15,6 +15,23 @@ from gradio_pdf import PDF
 import fitz
 
 import urllib.parse
+from sentence_transformers import CrossEncoder
+
+#-------------------------------------
+#            CONFIGURATION
+#-------------------------------------
+
+SIMILARITY_THRESHOLD = 0.55
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+EMBEDDING_MODEL_NAME = '/app/models/jina-embeddings-v4'
+LLM_MODEL_PATH = '/app/models/qwen2.5-7b-instruct-q6_k-00001-of-00002.gguf'
+RERANKER_MODEL_PATH = '/app/models/bge-reranker-v2-m3' 
+
+BASE_EMBEDDINGS_PATH = '/app/embeddings'
+AVAILABLE_BRANDS = ["SEW", "SINAMICS", "ROCKWELL"]
+
+LOADED_RESOURCES = {}
 
 #---Fonction pour encoder l'image---
 def encode_image(image_path):
@@ -27,6 +44,10 @@ def encode_image(image_path):
     except Exception as e:
         print(f"Erreur lors du chargement de l'image : {e}")
         return ""
+
+PATH_LOGO = '/app/models/selmoni.png'
+logo_base64 = encode_image(PATH_LOGO)
+img_src = f"data:image/png;base64,{logo_base64}" if logo_base64 else "https://via.placeholder.com/60"
 
 
 # --- Fonction pour extraire la page cible + contexte ---
@@ -63,72 +84,46 @@ def extract_pages_with_context(pdf_path, target_page_num, output_path, context=1
         print(f"Erreur CRITIQUE extraction PDF: {e}")
         return None
         
-        
-#-------------------------------------
-#           CONFIGURATION
-#-------------------------------------
-
-SIMILARITY_THRESHOLD = 0.55
-DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-
-EMBEDDING_MODEL_NAME = '/app/models/jina-embeddings-v4'
-LLM_MODEL_PATH = '/app/models/qwen2.5-7b-instruct-q6_k-00001-of-00002.gguf'
-
-BASE_EMBEDDINGS_PATH = '/app/embeddings'
-AVAILABLE_BRANDS = ["SEW", "SINAMICS", "ROCKWELL"]
-
-LOADED_RESOURCES = {}
-
-PATH_LOGO = '/app/models/selmoni.png'
-logo_base64 = encode_image(PATH_LOGO)
-img_src = f"data:image/png;base64,{logo_base64}" if logo_base64 else "https://via.placeholder.com/60"
 
 #-------------------------------------
 #    CLASSE WRAPPER JINA 
 #-------------------------------------
-class JinaEmbedder:#utilisation d'une classe pour le modèle Jina
-    
+class JinaEmbedder:
     def __init__(self, model_path, device):
         print(f" Chargement du modèle Jina sur : {device.upper()}")
         try:
-          
             self.model = AutoModel.from_pretrained(model_path, trust_remote_code=True, dtype=torch.float16 if torch.cuda.is_available() else torch.float32).to(device)
             self.model.eval()
         except Exception as e:
             print(f" Erreur chargement Jina: {e}")
             sys.exit(1)
+            
     #Embedding
     def encode(self, texts, normalize_embeddings=True):
-        if isinstance(texts, str): texts = [texts]#s'assure que l'entrée est une liste
+        if isinstance(texts, str): texts = [texts]
         
         with torch.no_grad():
-           
-            batch_output = self.model.encode_text(texts, task = "retrieval") #appel à la méthode d'encodage Jina
+            batch_output = self.model.encode_text(texts, task = "retrieval")
             
-            if isinstance(batch_output, list):# gère le cas où la sortie est une liste de tenseurs
-                embeddings = np.array([t.detach().cpu().numpy() if isinstance(t, torch.Tensor) else t for t in batch_output])#conversion en numpy array
-            elif isinstance(batch_output, torch.Tensor):# gère le cas où la sortie est un tenseur unique
-                embeddings = batch_output.detach().cpu().numpy()#conversion en numpy array
+            if isinstance(batch_output, list):
+                embeddings = np.array([t.detach().cpu().numpy() if isinstance(t, torch.Tensor) else t for t in batch_output])
+            elif isinstance(batch_output, torch.Tensor):
+                embeddings = batch_output.detach().cpu().numpy()
             else:
-                embeddings = np.array(batch_output)# conversion directe en numpy array
+                embeddings = np.array(batch_output)
+                
         if normalize_embeddings:
-            faiss.normalize_L2(embeddings)# normalisation L2 des embeddings
+            faiss.normalize_L2(embeddings)
             
-        return embeddings.astype('float32')# conversion finale en float32
+        return embeddings.astype('float32')
+
 
 #---------------------------------------
 #      CHARGEMENT DES RESSOURCES
 #---------------------------------------
-
-
 model = JinaEmbedder(EMBEDDING_MODEL_NAME, DEVICE)
 
 def get_brand_resources(brand_name):
-    """
-    Charge l'index FAISS et les chunks pour une marque spécifique si ce n'est pas déjà fait.
-    Retourne (index, text_chunks) ou lève une exception.
-    """
     if brand_name in LOADED_RESOURCES:
         return LOADED_RESOURCES[brand_name]['index'], LOADED_RESOURCES[brand_name]['chunks']
     
@@ -143,7 +138,6 @@ def get_brand_resources(brand_name):
         with open(pkl_path, 'rb') as f:
             chunks = pickle.load(f)
         
-        # Sauvegarde en cache mémoire
         LOADED_RESOURCES[brand_name] = {'index': index, 'chunks': chunks}
         print(f" Ressources {brand_name} chargées.")
         return index, chunks
@@ -151,93 +145,112 @@ def get_brand_resources(brand_name):
         print(f" Erreur chargement {brand_name}: {e}")
         raise e
 
-print("Ressources prêtes.")
-
+print("Ressources FAISS/Pickle prêtes.")
 
 #----- Chargement du LLM -----
 print(f" Chargement du LLM depuis : {LLM_MODEL_PATH}")
 llm = Llama(
     model_path=LLM_MODEL_PATH, 
-    n_ctx=8192,# Taille du contexte
-    n_gpu_layers=-1,      # Utilisation de toutes les couches GPU disponibles
-    n_batch=512,          # Taille du batch
-    f16_kv=True,          # Utilisation de la précision float16 pour les clés/valeurs
-    n_threads=os.cpu_count(),# Nombre de threads CPU
-    flash_attn=True, # Activation de l'attention flash
-    use_mmap=False, # Désactivation de la mémoire mappée
+    n_ctx=8192,
+    n_gpu_layers=-1,
+    n_batch=512,
+    f16_kv=True,
+    n_threads=os.cpu_count(),
+    flash_attn=True,
+    use_mmap=False,
 )
-print("Système prêt.")
+
+#----- Chargement du Reranker -----
+print(f" Chargement du Reranker Cross-Encoder depuis : {RERANKER_MODEL_PATH}")
+try:
+    reranker = CrossEncoder(RERANKER_MODEL_PATH, max_length=512, device=DEVICE)
+    print(" Reranker prêt.")
+except Exception as e:
+    print(f" Erreur chargement Reranker: {e}")
+
+print("Système global prêt.")
+
 
 #------------------------------
 #   LOGIQUE DE RECHERCHE 
 #------------------------------
-
 def search(query, index_obj, chunks_list, k=5):
-    print(f"Recherche pour: '{query}'")
+    print(f"Recherche FAISS pour: '{query}'")
     start_search_time = time.perf_counter()
     
-    query_embedding = model.encode([query], normalize_embeddings=True)# embedding de la requête
-    
-    similarities, indices = index_obj.search(query_embedding, k) # recherche dans l'index FAISS
+    query_embedding = model.encode([query], normalize_embeddings=True)
+    similarities, indices = index_obj.search(query_embedding, k)
     
     search_duration = time.perf_counter() - start_search_time
     
     results = []
     for i in range(k):
-        chunk_index = indices[0][i]# Indice du chunk
-        sim = similarities[0][i]# Similarité correspondante
+        chunk_index = indices[0][i]
+        sim = similarities[0][i]
         
-        if chunk_index < len(chunks_list):# Vérifie que l'indice est valide
+        if chunk_index < len(chunks_list):
             chunk_data = chunks_list[chunk_index]
             results.append(chunk_data)
         
     return results, similarities[0], search_duration
 
 #-------------------------------------------------
-#   FONCTIONS GRADIO & GENERATION
+#   FONCTION DE RERANKING NEURONAL
+#-------------------------------------------------
+def rerank_with_cross_encoder(query, chunks, similarities, top_n=15):
+    if not chunks:
+        return [], []
+
+    print(f" Reranking de {len(chunks)} chunks avec la requête brute : '{query}'")
+    
+    pairs = []
+    for c in chunks:
+        text = c.get('llm_context', c['text'])
+        pairs.append([query, text])
+
+    scores = reranker.predict(pairs)
+
+    combined = list(zip(chunks, similarities, scores))
+    combined.sort(key=lambda x: x[2], reverse=True)
+
+    print(f" Reranking terminé (Meilleur score : {combined[0][2]:.4f})")
+
+    reranked = combined[:top_n]
+    
+    final_chunks = [item[0] for item in reranked]
+    final_sims = [item[1] for item in reranked] 
+
+    return final_chunks, final_sims
+
+
+#-------------------------------------------------
+#   FONCTIONS UTILITAIRES
 #-------------------------------------------------
 def clear_chat():
-    """Réinitialise l'historique, le champ de texte et la vue PDF"""
     default_pdf_html = '<div style="height: 100%; display: flex; align-items: center; justify-content: center; color: #94a3b8;">Le document source s\'affichera ici après la recherche.</div>'
-    
-    return (
-        [],               # Vide le composant Chatbot 
-        "",               # Vide la barre de question
-        default_pdf_html  # Remet le message par défaut à la place du PDF
-    )
-
+    return ([], "", default_pdf_html)
 
 def stop_server():
     print("Arrêt du serveur...")
-    threading.Thread(target=lambda: (sys.exit())).start() # Lance l'arrêt du serveur dans un thread séparé
+    threading.Thread(target=lambda: (sys.exit())).start()
     return "Serveur arrêté."
-
-#-------------------------------------------
-#            Détection de mot clés dans les meilleurs chunks
-#-----------------------------------------------
 
 def find_best_matching_chunk(llm_answer, chunks):
     if not chunks or not llm_answer:
         return chunks[0] if chunks else None
     
-    # Pas de calcul si le LLM n'a rien trouvé
     if "introuvable" in llm_answer.lower():
         return chunks[0]
     
-    # Embedding de la réponse
     answer_embedding = model.encode([llm_answer], normalize_embeddings=True)
-    
-    # Embedding des chunks candidats
     chunk_texts = [c.get('llm_context', c['text']) for c in chunks]
     chunks_embeddings = model.encode(chunk_texts, normalize_embeddings=True)
     
-    # Similarité cosinus (les embeddings sont déjà normalisés → produit scalaire suffit)
     similarities = np.dot(chunks_embeddings, answer_embedding.T).flatten()
     best_idx = int(np.argmax(similarities))
     
     return chunks[best_idx]
-    
-    
+
 
 SEW_NOMENCLATURE_HINT = """
 RÈGLES DE DÉCODAGE DES RÉFÉRENCES SEW (À APPLIQUER SILENCIEUSEMENT) :
@@ -248,15 +261,14 @@ RÈGLES DE DÉCODAGE DES RÉFÉRENCES SEW (À APPLIQUER SILENCIEUSEMENT) :
 - Identifie la bonne ligne (ex: 5.3..) puis trouve la colonne où cette puissance (25) est strictement comprise dans la plage indiquée (ex: 0010 - 0055). La réponse est le nom de cette colonne.
 """
 def needs_nomenclature_hint(brand: str, query: str) -> bool:
-    """Détecte si la query implique un décodage de référence SEW."""
     if brand != "SEW":
         return False
-    # Détecte un pattern de référence type MCC91A-XXXX-XEX
     return bool(re.search(r"MCC\w+[-–]\d{4}[-–]\d+E\d+", query, re.IGNORECASE))
     
-    
-    
-    
+
+#-------------------------------------------------
+#   GÉNÉRATION PRINCIPALE
+#-------------------------------------------------
 def generate_response(brand,query,history=None, max_context_tokens=8000):
     if history is None:
         history = []
@@ -264,76 +276,38 @@ def generate_response(brand,query,history=None, max_context_tokens=8000):
     if not brand:
         return "Veuillez sélectionner une marque.", ""    
     
-    print(f"Début génération | Marque: {brand} | Query: '{query}'")
+    print(f"\nDébut génération | Marque: {brand} | Query: '{query}'")
     
-    # ==========Contextualisation de la recherche FAISS===============
+    # Contextualisation de la recherche FAISS (On garde l'historique juste pour FAISS)
     search_query = query
     if history:
-        # On récupère la toute dernière question posée par l'utilisateur
         last_user_query = history[-1][0]
-        # On combine l'ancienne et la nouvelle question pour aider FAISS
-        # Ex: "Quelles sont les causes du défaut 11.9 ? Comment le corriger ?"
         search_query = f"{last_user_query} {query}"
         print(f"Recherche FAISS reformulée : '{search_query}'")
-    # =========================================================
     
-    
-    # Chargement dynamique des ressources de la marque
+    # Chargement dynamique des ressources
     try:
         current_index, current_chunks = get_brand_resources(brand)
     except Exception as e:
         return f"Erreur critique lors du chargement de la marque {brand} : {str(e)}", ""
     
-    # Recherche large (FAISS)
-    relevant_chunks, similarities, search_time = search(search_query, current_index, current_chunks, k=15)
+    # 1. Recherche large (FAISS) -> On prend k=30 pour donner du choix au Reranker
+    relevant_chunks, similarities, search_time = search(search_query, current_index, current_chunks, k=30)
+    
+    # 2. On utilise UNIQUEMENT la 'query' pure et dure pour recentrer sur la vraie question
+    relevant_chunks, similarities = rerank_with_cross_encoder(query, relevant_chunks, similarities, top_n=15)
     
     pdf_html_output = '<div style="text-align:center; color:#94a3b8;">Aucun document à afficher.</div>'
     
     if not relevant_chunks:
         return "Aucune information trouvée.",""
     
-    #--- GESTION DU PDF ---
-    best_chunk = relevant_chunks[0]
-    filename = best_chunk.get('source', '')
-    page_num = best_chunk.get('page', 1)
-    
-    base_folder = "/app/data"
-    full_path = os.path.join(base_folder, filename)
-    
-    # Fichier temporaire
-    temp_pdf_path = f"/tmp/context_{page_num}_{int(time.time())}.pdf"
-    
-    
-    if os.path.exists(full_path) and similarities[0] >= SIMILARITY_THRESHOLD:
-        print(f"Extraction avec contexte (3 pages)...")
-        
-        # On extrait 3 pages : [Page Avant] - [Page Cible] - [Page Après]
-        extracted_path = extract_pages_with_context(full_path, page_num, temp_pdf_path, context=1)
-        
-        if extracted_path:
-            try:
-                # On convertit le fichier PDF (les 3 pages) en texte Base64
-                with open(extracted_path, "rb") as f:
-                    pdf_base64 = base64.b64encode(f.read()).decode('utf-8')
-                
-                pdf_data_url = f"data:application/pdf;base64,{pdf_base64}#page=2"
-                
-                pdf_html_output = f"""
-                    <iframe src="{pdf_data_url}" width="100%" height="800px" style="border:none; border-radius:8px;">
-                    </iframe>
-                """
-            except Exception as e:
-                print(f"Erreur Base64: {e}")
-                pdf_html_output = f"Erreur : {e}"
-    
-    
     context_texts = []
     sources_formatted = [] 
     current_token_count = 0
     seen_hashes = set()
     
-    # --- NOUVEAU : On définit notre objectif ---
-    MAX_CHUNKS_TO_INJECT = 5
+    MAX_CHUNKS_TO_INJECT = 10
     chunks_injected = 0
 
     system_overhead = len(llm.tokenize(b"System prompt template overhead...")) + 500 
@@ -345,7 +319,6 @@ def generate_response(brand,query,history=None, max_context_tokens=8000):
 
     for i, (chunk_data, sim) in enumerate(zip(relevant_chunks, similarities)):
         
-        # --- NOUVEAU : On s'arrête si on a nos 5 bons chunks ---
         if chunks_injected >= MAX_CHUNKS_TO_INJECT:
             print(f"\n [Stop] Objectif atteint : {MAX_CHUNKS_TO_INJECT} chunks uniques injectés.")
             break
@@ -356,13 +329,11 @@ def generate_response(brand,query,history=None, max_context_tokens=8000):
         
         source_identifier = f"{filename} (Page {page_num})"
 
-        # Filtre Anti-doublon
         content_hash = hash(text_content)
         if content_hash in seen_hashes:
             print(f" [Doublon ignoré] {source_identifier} (déjà injecté)")
             continue
 
-        # Filtre Pertinence
         if sim < SIMILARITY_THRESHOLD: 
             print(f" [Rejeté - Score faible] {source_identifier} (Sim: {sim:.4f})")
             continue
@@ -370,19 +341,15 @@ def generate_response(brand,query,history=None, max_context_tokens=8000):
         chunk_tokens = llm.tokenize(text_content.encode("utf-8"))
         num_tokens = len(chunk_tokens)
 
-        # Filtre Contexte (Tokens)
         if current_token_count + num_tokens > max_context_tokens:
             print(f" [Stop - Contexte plein] {source_identifier} ne rentre pas.")
             break 
             
-        # ========================================================
-        # ZONE DE VALIDATION 
-        # ========================================================
+        # Validation du chunk
         seen_hashes.add(content_hash)
         context_texts.append(text_content)
-        chunks_injected += 1 # On incrémente notre compteur !
+        chunks_injected += 1 
         
-        # Formatage 
         source_line = f"{filename} — Page {page_num} (Score: {sim:.4f})"
         if len(sources_formatted) < 3 :
             sources_formatted.append(source_line)
@@ -397,12 +364,7 @@ def generate_response(brand,query,history=None, max_context_tokens=8000):
     if not context_texts:
         return "Documents trouvés mais pertinence trop faible (aucun chunk n'a été retenu).",""
     
-
-    
-    # Construction du contexte final
     context = "\n\n---\n\n".join(context_texts)
-    
-    # Création de la chaîne avec sauts de ligne pour les sources
     source_list_str = "\n".join(sources_formatted)
     
     print(f"\n Résumé Contexte : {len(context_texts)} chunks injectés.")
@@ -425,23 +387,20 @@ def generate_response(brand,query,history=None, max_context_tokens=8000):
     )
     
     for old_query, old_response in history[-3:]:
-        # On supprime la partie "Sources utilisées" de l'ancienne réponse pour économiser des tokens
         clean_old_response = old_response.split("\n\n---")[0].strip()
         prompt_template += f"<|im_start|>user\n{old_query}<|im_end|>\n"
         prompt_template += f"<|im_start|>assistant\n{clean_old_response}<|im_end|>\n"
 
-    # On ajoute le contexte actuel et la nouvelle question
     prompt_template += f"<|im_start|>user\nCONTEXTE:\n{context}\n\nQUESTION:\n{query}<|im_end|>\n<|im_start|>assistant\n"
-
 
     print(" Génération de la réponse par le LLM...")
     start_llm = time.perf_counter()
     
     response = llm(
         prompt=prompt_template,
-        max_tokens=512, # 512 est amplement suffisant maintenant
+        max_tokens=512,
         stop=["<|im_end|>", "<|im_start|>", "user\n", "CONTEXTE:\n"], 
-        temperature=0.1,
+        temperature=0.01,
         repeat_penalty=1.15,      
         frequency_penalty=0.2,    
         presence_penalty=0.2      
@@ -450,16 +409,10 @@ def generate_response(brand,query,history=None, max_context_tokens=8000):
     duration = time.perf_counter() - start_llm
     answer = response['choices'][0]['text'].strip() 
     
-    # On garde le print pour le debug au cas où !
     print(f"\n--- RÉPONSE BRUTE DU LLM ---\n{answer}\n----------------------------\n")
     print(f" Réponse générée en {duration:.2f}s")
     
-    # ====================================================================
-    # On trouve la page après la réponse du LLM
-    # ====================================================================
-    pdf_html_output = '<div style="text-align:center; color:#94a3b8;">Aucun document à afficher.</div>'
-    
-    # On compare les mots de la réponse avec les mots des chunks pour trouver le vrai
+    # --- GESTION DU PDF POST-GÉNÉRATION ---
     target_chunk = find_best_matching_chunk(answer, relevant_chunks)
     
     if target_chunk:
@@ -471,7 +424,6 @@ def generate_response(brand,query,history=None, max_context_tokens=8000):
         full_path = os.path.join(base_folder, filename)
         temp_pdf_path = f"/tmp/context_{page_num}_{int(time.time())}.pdf"
         
-        # On s'assure que le fichier existe avant d'extraire
         if os.path.exists(full_path):
             print(f"Extraction avec contexte (3 pages) pour la page {page_num}...")
             extracted_path = extract_pages_with_context(full_path, page_num, temp_pdf_path, context=1)
@@ -504,11 +456,7 @@ def generate_response(brand,query,history=None, max_context_tokens=8000):
 
 
 def chat_interaction(brand, query, history):
-    """
-    Gère l'interaction avec le composant Chatbot.
-    history est une liste de tuples : [(user_msg, bot_msg), ...]
-    """
-    history = history or [] # Initialise l'historique si vide
+    history = history or [] 
     
     if not brand:
         history.append((query, " Veuillez sélectionner une marque."))
@@ -517,15 +465,10 @@ def chat_interaction(brand, query, history):
     if not query.strip():
         return history, "", '<div style="text-align:center; color:#94a3b8;">Veuillez poser une question.</div>'
 
-    # Appel de votre fonction de génération actuelle
-    answer_text, pdf_html = generate_response(brand, query,history)
-    
-    # Ajout de l'échange actuel à l'historique visuel
+    answer_text, pdf_html = generate_response(brand, query, history)
     history.append((query, answer_text))
     
-    # On retourne : l'historique mis à jour, une chaîne vide (pour effacer la barre de saisie), et le visualiseur PDF
     return history, "", pdf_html
-
 
 
 #------Interface Gradio-------
@@ -542,8 +485,6 @@ css_style = """
         margin: 0 auto; 
         padding-top: 30px; 
     }
-    
-    /* En-tête */
     .header-container { 
         display: flex; 
         align-items: center; 
@@ -559,8 +500,6 @@ css_style = """
         color: #0f172a; 
         margin: 0; 
     }
-
-    /* Colonnes principales */
     .main-row { gap: 30px; }
     .chat-col, .pdf-col {
         background-color: white;
@@ -570,8 +509,6 @@ css_style = """
         border: 1px solid #f1f5f9;
         height: fit-content;
     }
-    
-    /* Chatbot */
     #chatbot-component {
         height: 600px !important;
         border: 1px solid #e2e8f0;
@@ -589,8 +526,6 @@ css_style = """
         border-bottom-left-radius: 0 !important;
         color: #334155 !important;
     }
-
-    /* Zone de saisie */
     .input-row {
         margin-top: 20px;
         align-items: stretch;
@@ -619,8 +554,6 @@ css_style = """
         transition: background-color 0.2s;
     }
     .blue-btn:hover { background-color: #2563eb !important; }
-
-    /* Boutons du bas */
     .actions-row { margin-top: 20px; justify-content: space-between; }
     .secondary-btn {
         background-color: white !important;
@@ -643,8 +576,6 @@ css_style = """
         background-color: #fecaca !important;
         color: #b91c1c !important;
     }
-
-    /* Titres de section */
     .section-title {
         font-size: 1.2em;
         font-weight: 600;
@@ -652,8 +583,6 @@ css_style = """
         margin-bottom: 15px;
         display: block;
     }
-
-    /* Pied de page */
     .footer {
         text-align: center; 
         color: #94a3b8; 
@@ -673,9 +602,7 @@ with gr.Blocks(title="Assistant IA Selmoni", css=css_style) as interface:
     """)
     
     with gr.Row(elem_classes="main-row"):
-        # --- COLONNE GAUCHE : CHATBOT & INPUT ---
         with gr.Column(scale=1, elem_classes="chat-col"):
-            
             brand_selector = gr.Dropdown(
                 choices=AVAILABLE_BRANDS,
                 value=AVAILABLE_BRANDS[0], 
@@ -683,23 +610,21 @@ with gr.Blocks(title="Assistant IA Selmoni", css=css_style) as interface:
                 interactive=True
             )
             
-            
             chatbot = gr.Chatbot(
                 label="Conversation avec l'IA", 
                 height=500,
                 show_copy_button=True
             )
             
-            # Zone de saisie et bouton sur la même ligne
             with gr.Row(elem_classes="input-row"):
                 question = gr.Textbox(
                     show_label=False, 
                     placeholder="Ex: Que faire lorsque le défaut 11.9 intervient ?",
-                    lines=3,           # Définit la hauteur de base à 3 lignes
-                    max_lines=10,      # Permet à la boîte de s'agrandir jusqu'à 10 lignes si le texte est long
+                    lines=3,
+                    max_lines=10,
                     scale=4, 
-                    elem_classes="question-box", # Applique votre joli CSS personnalisé
-                    container=False    # Enlève le cadre superflu de Gradio
+                    elem_classes="question-box",
+                    container=False
                 )
                 ask_button = gr.Button("Envoyer", variant="primary", elem_classes="blue-btn", scale=1)
             
@@ -710,42 +635,17 @@ with gr.Blocks(title="Assistant IA Selmoni", css=css_style) as interface:
             gr.Markdown("---")
             gr.HTML("<div style='text-align:center; color:#94a3b8; font-size: 0.8em;'>© 2026 Selmoni - Système RAG Interne</div>")
         
-        # --- COLONNE DROITE : VISUALISATION PDF (Inchangée) ---
         with gr.Column(scale=1, elem_classes="pdf-col"):
             gr.Markdown("### Document Source (Page extraite)")
             pdf_viewer = gr.HTML(
                 value='<div style="height: 100%; display: flex; align-items: center; justify-content: center; color: #94a3b8;">Le document source s\'affichera ici après la recherche.</div>'
             )
             
-    # --- GESTION DES ÉVÉNEMENTS ---
-    # Quand on appuie sur "Entrée"
-    question.submit(
-        fn=chat_interaction, 
-        inputs=[brand_selector, question, chatbot],
-        outputs=[chatbot, question, pdf_viewer] # Met à jour le chat, vide l'input, met à jour le PDF
-    )
-    brand_selector.change(
-        fn=clear_chat, 
-        inputs=None, 
-        outputs=[chatbot, question, pdf_viewer]
-    )
-    # Quand on clique sur le bouton "Envoyer"
-    ask_button.click(
-        fn=chat_interaction, 
-        inputs=[brand_selector, question, chatbot],
-        outputs=[chatbot, question, pdf_viewer]
-    )
-    
+    question.submit(fn=chat_interaction, inputs=[brand_selector, question, chatbot], outputs=[chatbot, question, pdf_viewer])
+    brand_selector.change(fn=clear_chat, inputs=None, outputs=[chatbot, question, pdf_viewer])
+    ask_button.click(fn=chat_interaction, inputs=[brand_selector, question, chatbot], outputs=[chatbot, question, pdf_viewer])
     stop_button.click(fn=stop_server, inputs=None, outputs=None)
-    
-    clear_button.click(
-        fn=clear_chat, 
-        inputs=None, 
-        outputs=[chatbot, question, pdf_viewer]
-    )
-
-
-
+    clear_button.click(fn=clear_chat, inputs=None, outputs=[chatbot, question, pdf_viewer])
 
 if __name__ == "__main__":
     interface.launch(

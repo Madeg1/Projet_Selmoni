@@ -3,8 +3,10 @@ FROM nvidia/cuda:12.4.1-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+# --- NOUVEAU : On désactive l'erreur "externally-managed-environment" ---
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
+
 # Mettre à jour l'OS et installer les dépendances
-# (Nous gardons cmake et python3.11-dev au cas où une autre dépendance en aurait besoin)
 RUN apt-get update && apt-get install -y \
     build-essential \
     git \
@@ -35,8 +37,10 @@ WORKDIR /app
 COPY requirements.txt .
 RUN python -m pip install --no-cache-dir -r requirements.txt
 
-# --- NOUVELLE SOLUTION : INSTALLATION PRÉ-COMPILÉE ---
+# --- Installation du Reranker et de l'outil de téléchargement ---
+RUN python -m pip install --no-cache-dir sentence-transformers "huggingface_hub[cli]"
 
+# --- INSTALLATION PRÉ-COMPILÉE LLAMA-CPP ---
 RUN python -m pip install llama-cpp-python --force-reinstall --no-cache-dir \
     --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124
 
@@ -47,4 +51,4 @@ COPY . .
 EXPOSE 7860
 
 # Étape 6 : Commande de lancement
-CMD ["python", "scripts/Query_LLM_JINA4.py"]
+CMD ["python", "scripts/Query_LLM_JINA4_bis.py"]
