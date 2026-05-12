@@ -33,6 +33,9 @@ AVAILABLE_BRANDS = ["SEW", "SINAMICS", "ROCKWELL"]
 
 LOADED_RESOURCES = {}
 
+CHUNKS_FAISS   = 5   # Nb de chunks FAISS bruts envoyés au LLM  (0 = aucun)
+CHUNKS_RERANK  = 0   # Nb de chunks reranker envoyés au LLM      (0 = aucun)
+
 #---Fonction pour encoder l'image---
 def encode_image(image_path):
     """Convertit une image en chaîne base64 pour l'intégration HTML directe"""
@@ -291,24 +294,45 @@ def generate_response(brand,query,history=None, max_context_tokens=8000):
     except Exception as e:
         return f"Erreur critique lors du chargement de la marque {brand} : {str(e)}", ""
     
-    # 1. Recherche large (FAISS) -> On prend k=30 pour donner du choix au Reranker
-    relevant_chunks, similarities, search_time = search(search_query, current_index, current_chunks, k=30)
-    
-    # 2. On utilise UNIQUEMENT la 'query' pure et dure pour recentrer sur la vraie question
-    relevant_chunks, similarities = rerank_with_cross_encoder(query, relevant_chunks, similarities, top_n=15)
-    
-    pdf_html_output = '<div style="text-align:center; color:#94a3b8;">Aucun document à afficher.</div>'
-    
-    if not relevant_chunks:
-        return "Aucune information trouvée.",""
-    
-    context_texts = []
-    sources_formatted = [] 
-    current_token_count = 0
+    # 1. Recherche FAISS large (pool de candidats)
+    pool_size = max(30, CHUNKS_FAISS + CHUNKS_RERANK * 3)
+    relevant_chunks, similarities, search_time = search(
+        search_query, current_index, current_chunks, k=pool_size
+    )
+
+    # 2. Chunks FAISS bruts (top N sans reranking)
+    faiss_chunks  = relevant_chunks[:CHUNKS_FAISS]
+    faiss_sims    = list(similarities[:CHUNKS_FAISS])
+
+    # 3. Chunks reranker (si activé)
+    if CHUNKS_RERANK > 0:
+        reranked_chunks, reranked_sims = rerank_with_cross_encoder(
+            query, relevant_chunks, similarities, top_n=CHUNKS_RERANK
+        )
+    else:
+        reranked_chunks, reranked_sims = [], []
+
+    # 4. Fusion avec déduplication (FAISS d'abord, reranker ensuite)
     seen_hashes = set()
-    
-    MAX_CHUNKS_TO_INJECT = 10
+    final_chunks, final_sims = [], []
+    for chunk, sim in list(zip(faiss_chunks, faiss_sims)) + list(zip(reranked_chunks, reranked_sims)):
+        h = hash(chunk.get('llm_context', chunk['text']))
+        if h not in seen_hashes:
+            seen_hashes.add(h)
+            final_chunks.append(chunk)
+            final_sims.append(sim)
+
+    pdf_html_output = '<div style="text-align:center; color:#94a3b8;">Aucun document à afficher.</div>'
+
+    if not final_chunks:
+        return "Aucune information trouvée.", ""
+
+    context_texts = []
+    sources_formatted = []
+    current_token_count = 0
+    MAX_CHUNKS_TO_INJECT = 15 
     chunks_injected = 0
+    seen_hashes = set()
 
     system_overhead = len(llm.tokenize(b"System prompt template overhead...")) + 500 
     limit = 8192 - system_overhead - 512 
@@ -317,7 +341,7 @@ def generate_response(brand,query,history=None, max_context_tokens=8000):
     print(f"ANALYSE DES CHUNKS POUR : {query}")
     print(f"{'='*60}")
 
-    for i, (chunk_data, sim) in enumerate(zip(relevant_chunks, similarities)):
+    for i, (chunk_data, sim) in enumerate(zip(final_chunks, final_sims)):
         
         if chunks_injected >= MAX_CHUNKS_TO_INJECT:
             print(f"\n [Stop] Objectif atteint : {MAX_CHUNKS_TO_INJECT} chunks uniques injectés.")
@@ -372,19 +396,30 @@ def generate_response(brand,query,history=None, max_context_tokens=8000):
     hint = SEW_NOMENCLATURE_HINT if needs_nomenclature_hint(brand, query) else ""
     
     prompt_template = (
-        "<|im_start|>system\n"
-        "Tu es un assistant expert technique chez Selmoni.\n"
-        + hint +
-        "Utilise UNIQUEMENT le contexte ci-dessous ET l'historique pour répondre.\n"
-        "ATTENTION : Le contexte contient des tableaux au format Markdown. Lis attentivement les en-têtes de colonnes.\n"
-        "RÈGLE ABSOLUE 1 : Si la réponse n'est pas EXPLICITEMENT dans le contexte, réponds STRICTEMENT ET UNIQUEMENT \"Information introuvable.\". N'ajoute aucune explication.\n"
-        "RÈGLE ABSOLUE 2 : Si tu trouves la réponse, formule-la en UNE phrase complète qui reprend les termes clés de la question et de la réponse. "
-        "La phrase doit être suffisamment explicite pour être comprise sans la question. "
-        "Exemple : 'Le self réseau à utiliser avec un variateur MCC91A série 5.3 de puissance 0025 est le ND0070-503.' "
-        "INTERDIT : répondre avec une référence seule comme 'ND0070-503' ou 'BW100-001'.\n"
-        "RÈGLE ABSOLUE 3 : NE DÉTAILLE JAMAIS les étapes de ta recherche, tes calculs ou ton raisonnement.\n"
-        "<|im_end|>\n"
-    )
+    "<|im_start|>system\n"
+    "Tu es un assistant expert technique industriel.\n"
+    + hint +
+    "Utilise UNIQUEMENT le contexte fourni ci-dessous pour répondre. "
+    "Ne complète jamais avec tes connaissances générales.\n\n"
+    "RÈGLE 1 — INFORMATION ABSENTE : "
+    "Si la réponse n'est pas présente mot pour mot dans le contexte, "
+    "réponds UNIQUEMENT et EXACTEMENT : \"Information introuvable.\"\n\n"
+    "RÈGLE 2 — RÉPONSE TROUVÉE : "
+    "Formule la réponse en une ou deux phrases complètes et autonomes, "
+    "c'est-à-dire compréhensibles sans relire la question. "
+    "Inclus toujours : le sujet de la question, la valeur ou référence trouvée, "
+    "et l'unité ou le contexte si pertinent.\n"
+    "Exemples de formulation attendue :\n"
+    "  • 'La consommation du signal X est de 150 mW.'\n"
+    "  • 'Il est possible de connecter jusqu'à 8 variateurs sur une seule passerelle.'\n"
+    "  • 'Non, la résistance de 27 Ω / 0.1 kW n'est pas compatible avec ce variateur "
+    "car la valeur minimale requise est de Y Ω.'\n\n"
+    "RÈGLE 3 — INTERDICTIONS ABSOLUES :\n"
+    "  - Ne donne jamais une référence ou valeur seule sans phrase de contexte.\n"
+    "  - Ne détaille jamais ton raisonnement ou tes étapes de recherche.\n"
+    "  - N'invente jamais de données absentes du contexte.\n"
+    "<|im_end|>\n"
+)
     
     for old_query, old_response in history[-3:]:
         clean_old_response = old_response.split("\n\n---")[0].strip()
@@ -413,7 +448,7 @@ def generate_response(brand,query,history=None, max_context_tokens=8000):
     print(f" Réponse générée en {duration:.2f}s")
     
     # --- GESTION DU PDF POST-GÉNÉRATION ---
-    target_chunk = find_best_matching_chunk(answer, relevant_chunks)
+    target_chunk = find_best_matching_chunk(answer, final_chunks)
     
     if target_chunk:
         filename = target_chunk.get('source', '')

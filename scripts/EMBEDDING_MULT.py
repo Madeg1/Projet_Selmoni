@@ -150,18 +150,26 @@ def process_page_hirag(content: str, source: str, page_num: int, tokenizer) -> l
         nonlocal current_text_block
         if not current_text_block:
             return
-        
+    
         raw_text = "\n".join(current_text_block).strip()
+    
+    
+        lines_with_content = [
+            l for l in raw_text.split('\n')
+            if l.strip() and not l.strip().startswith('#')
+        ]
+        if not lines_with_content:
+            current_text_block = []
+            return
+    
         if raw_text:
             hierarchy_prefix = get_hierarchy_context()
-            
-            # Si le bloc est trop long, on le sub-chunk (ex: très long paragraphe)
             sub_chunks = split_into_markdown(raw_text, tokenizer, MAX_TOKENS, CHUNK_OVERLAP)
             for sc in sub_chunks:
                 final_text = hierarchy_prefix + sc
                 chunks.append({
-                    "text": final_text,         # Jina lit le contexte + le texte
-                    "llm_context": final_text,  # Qwen lit la même chose
+                    "text": final_text,
+                    "llm_context": final_text,
                     "source": source,
                     "page": page_num,
                     "is_table": False,
@@ -170,6 +178,49 @@ def process_page_hirag(content: str, source: str, page_num: int, tokenizer) -> l
         current_text_block = []
 
     def flush_table():
+        def parse_table_to_prose(header_line: str, separator_line: str, data_rows: list[str]) -> str:
+            try:
+                headers = [h.strip() for h in header_line.strip().strip('|').split('|')]
+                sentences = []
+
+                for row in data_rows:
+                    cells = [c.strip() for c in row.strip().strip('|').split('|')]
+                    if len(cells) < 2 or not cells[0]:
+                        continue
+
+                    label = cells[0]
+
+                    # Détecte si la colonne 1 ressemble à une unité (courte, pas de chiffre isolé)
+                    # Ex: "W", "A", "Hz", "kW", "V", "kg", "s", "min⁻¹"
+                    inline_unit = ""
+                    value_start = 1
+                    if len(cells) >= 3:
+                        potential_unit = cells[1]
+                        is_unit = (
+                            len(potential_unit) <= 5
+                            and not any(c.isdigit() for c in potential_unit)
+                            and potential_unit not in ['-', '–', '—', '']
+                        )
+                        if is_unit:
+                            inline_unit = potential_unit
+                            value_start = 2  # La valeur est en cells[2]
+
+                    for i, cell in enumerate(cells[value_start:], start=value_start):
+                        if not cell or cell in ['-', '–', '—', '']:
+                            continue
+                        is_short_numeric = len(cell) <= 5 and any(c.isdigit() for c in cell)
+                        if not is_short_numeric:
+                            continue
+
+                        unit = inline_unit or (headers[i] if i < len(headers) else "")
+                        phrase = f"{label} : {cell} {unit}".strip()
+                        sentences.append(phrase)
+                        break
+
+                return "\n".join(sentences)
+            except Exception:
+                return ""
+    
         nonlocal current_table, table_intro
         if len(current_table) < 3: # Pas un vrai tableau Markdown
             if table_intro: # On restaure l'intro si ce n'était pas un vrai tableau
@@ -186,7 +237,24 @@ def process_page_hirag(content: str, source: str, page_num: int, tokenizer) -> l
         
         header = current_table[0]
         separator = current_table[1]
-        data_rows = current_table[2:]
+        raw_data_rows = current_table[2:]
+        
+        
+        data_rows = []
+        for row in raw_data_rows:
+            cells = [c.strip() for c in row.strip().strip('|').split('|')]
+            first_cell = cells[0] if cells else ''
+            is_continuation = first_cell in ('--', '–', '—', '') and data_rows
+            if is_continuation:
+                # On concatène le contenu à la dernière cellule Action de la ligne précédente
+                prev_cells = [c.strip() for c in data_rows[-1].strip().strip('|').split('|')]
+                # On ajoute le texte à la dernière cellule non vide
+                continuation_text = ' '.join(c for c in cells if c and c not in ('--', '–', '—'))
+                if continuation_text and prev_cells:
+                    prev_cells[-1] = (prev_cells[-1] + ' / ' + continuation_text).strip(' /')
+                    data_rows[-1] = '| ' + ' | '.join(prev_cells) + ' |'
+            else:
+                data_rows.append(row)
         
         # Contexte complet envoyé au LLM : Hiérarchie + Texte Introductif + Tableau complet
         full_table_markdown = hierarchy_prefix + intro_str + "\n".join(current_table)
@@ -199,7 +267,9 @@ def process_page_hirag(content: str, source: str, page_num: int, tokenizer) -> l
             
             # Jina verra maintenant la phrase "Le tableau suivant montre..." !
             embedding_text = hierarchy_prefix + intro_str + mini_table
-            
+            prose = parse_table_to_prose(header, separator, batch_rows)
+            if prose:
+                embedding_text += "\n\n" + prose
             chunks.append({
                 "text": embedding_text,      # Mini-tableau avec en-têtes + intro
                 "llm_context": full_table_markdown,  # Tableau COMPLET + intro
@@ -271,6 +341,11 @@ def chunks_from_json(json_path: Path, tokenizer) -> list[dict]:
 
         content = ftfy.fix_text(raw_content)
         # On passe directement la page à notre processeur HiRAG
+        
+        content = re.sub(r'```[\w]*\s*```', '', content)        # blocs vides
+        content = re.sub(r'```[\w]*\s*\n\s*```', '', content)   # blocs vides multi-ligne
+        content = re.sub(r'\n{3,}', '\n\n', content)
+        
         page_chunks = process_page_hirag(content, source, page.get("page"), tokenizer)
         all_chunks.extend(page_chunks)
 
