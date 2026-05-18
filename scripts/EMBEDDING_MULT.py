@@ -123,7 +123,7 @@ def split_into_markdown(text: str, tokenizer, max_tokens: int, overlap: int = 10
     return chunks
 
 
-def process_page_hirag(content: str, source: str, page_num: int, tokenizer) -> list[dict]:
+def process_page_hirag(content: str, source: str, page_num: int, tokenizer, dynamic_blacklist: set) -> list[dict]:
     """
     Parcourt la page ligne par ligne en mémorisant la hiérarchie des titres (H1, H2, H3...).
     Sépare proprement les blocs de texte et les tableaux sans doublons.
@@ -150,18 +150,30 @@ def process_page_hirag(content: str, source: str, page_num: int, tokenizer) -> l
         nonlocal current_text_block
         if not current_text_block:
             return
-    
         raw_text = "\n".join(current_text_block).strip()
-    
-    
-        lines_with_content = [
-            l for l in raw_text.split('\n')
-            if l.strip() and not l.strip().startswith('#')
-        ]
+        lines_with_content = []
+        for l in raw_text.split('\n'):
+            stripped = l.strip()
+            
+            #Ignorer les lignes vides ou les titres Markdown 
+            if not stripped or stripped.startswith('#'):
+                continue
+            if stripped in dynamic_blacklist:
+                continue    
+            letters_count = sum(c.isalpha() for c in stripped)
+            if len(stripped) < 25 and letters_count < 5:
+                continue
+                
+            lines_with_content.append(stripped)
+
         if not lines_with_content:
             current_text_block = []
             return
-    
+            
+        content_text = " ".join(lines_with_content).strip()
+        if len(content_text) < 40:   # moins de ~40 caractères = numéro de page, référence seule, etc.
+            current_text_block = []
+            return
         if raw_text:
             hierarchy_prefix = get_hierarchy_context()
             sub_chunks = split_into_markdown(raw_text, tokenizer, MAX_TOKENS, CHUNK_OVERLAP)
@@ -333,20 +345,42 @@ def chunks_from_json(json_path: Path, tokenizer) -> list[dict]:
     except ValueError:
         source = Path(stored_filepath).name
 
-    all_chunks = []
-    for page in doc.get("pages", []):
+    pages = doc.get("pages", [])
+    total_pages = len(pages)
+
+    # 1. NETTOYER TOUTES LES PAGES EN PREMIER
+    cleaned_pages = []
+    for page in pages:
         raw_content = page.get("content", "")
         if not raw_content:
+            cleaned_pages.append((page.get("page", 0), ""))
             continue
-
+            
         content = ftfy.fix_text(raw_content)
-        # On passe directement la page à notre processeur HiRAG
-        
-        content = re.sub(r'```[\w]*\s*```', '', content)        # blocs vides
-        content = re.sub(r'```[\w]*\s*\n\s*```', '', content)   # blocs vides multi-ligne
+        content = re.sub(r'```[\w]*\s*```', '', content)
+        content = re.sub(r'```[\w]*\s*\n\s*```', '', content)
         content = re.sub(r'\n{3,}', '\n\n', content)
-        
-        page_chunks = process_page_hirag(content, source, page.get("page"), tokenizer)
+        cleaned_pages.append((page.get("page", 0), content))
+
+    # 2. DÉTECTION DU BOILERPLATE SUR LE TEXTE NETTOYÉ
+    line_frequencies = {}
+    for _, content in cleaned_pages:
+        if not content:
+            continue
+        unique_lines = set(l.strip() for l in content.split('\n') if len(l.strip()) > 3)
+        for line in unique_lines:
+            line_frequencies[line] = line_frequencies.get(line, 0) + 1
+
+    # Seuil à 20% des pages (min 3)
+    threshold = max(3, int(total_pages * 0.20))
+    dynamic_blacklist = {line for line, freq in line_frequencies.items() if freq >= threshold}
+
+    # 3. EXTRACTION DES CHUNKS
+    all_chunks = []
+    for page_num, content in cleaned_pages:
+        if not content:
+            continue
+        page_chunks = process_page_hirag(content, source, page_num, tokenizer, dynamic_blacklist)
         all_chunks.extend(page_chunks)
 
     return all_chunks
