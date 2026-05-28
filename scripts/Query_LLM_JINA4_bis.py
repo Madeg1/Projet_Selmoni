@@ -33,8 +33,8 @@ AVAILABLE_BRANDS = ["SEW", "SINAMICS", "ROCKWELL"]
 
 LOADED_RESOURCES = {}
 
-CHUNKS_FAISS   = 5   # Nb de chunks FAISS bruts envoyés au LLM  (0 = aucun)
-CHUNKS_RERANK  = 0   # Nb de chunks reranker envoyés au LLM      (0 = aucun)
+CHUNKS_FAISS   = 4   # Nb de chunks FAISS bruts envoyés au LLM  (0 = aucun)
+CHUNKS_RERANK  = 4   # Nb de chunks reranker envoyés au LLM      (0 = aucun)
 
 #---Fonction pour encoder l'image---
 def encode_image(image_path):
