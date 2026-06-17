@@ -3,7 +3,6 @@ FROM nvidia/cuda:12.4.1-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# --- NOUVEAU : On désactive l'erreur "externally-managed-environment" ---
 ENV PIP_BREAK_SYSTEM_PACKAGES=1
 
 # Mettre à jour l'OS et installer les dépendances
