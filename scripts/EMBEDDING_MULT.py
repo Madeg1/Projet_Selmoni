@@ -136,7 +136,7 @@ def process_page_hirag(content: str, source: str, page_num: int, tokenizer, dyna
     current_text_block = []
     current_table = []
     in_table = False
-    table_intro = ""  # <--- NOUVEAU : Mémoire tampon pour l'intro du tableau
+    table_intro = ""  
     
     def get_hierarchy_context() -> str:
         """Génère le chemin sémantique parent pour le chunk."""
@@ -244,7 +244,6 @@ def process_page_hirag(content: str, source: str, page_num: int, tokenizer, dyna
             
         hierarchy_prefix = get_hierarchy_context()
         
-        # --- NOUVEAU : On fusionne l'intro avec le tableau ---
         intro_str = f"{table_intro}\n\n" if table_intro else ""
         
         header = current_table[0]
@@ -314,7 +313,6 @@ def process_page_hirag(content: str, source: str, page_num: int, tokenizer, dyna
             
         elif is_table_line:
             if not in_table:
-                # --- NOUVEAU : On ne flush plus le texte, on l'absorbe ! ---
                 table_intro = "\n".join(current_text_block).strip()
                 current_text_block = [] # On vide le bloc pour qu'il ne soit pas flushé en texte standard
                 in_table = True
